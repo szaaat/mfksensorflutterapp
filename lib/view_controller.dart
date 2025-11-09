@@ -1,4 +1,3 @@
-import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_background_service/flutter_background_service.dart';
 import 'package:mfk_sensor/services/database_manager.dart';
@@ -26,20 +25,20 @@ class _ViewControllerState extends State<ViewController> {
   String _latestLocation = 'No GPS data';
   int _unsyncedCount = 0;
   bool _isServiceRunning = true;
-  double _saveInterval = 2.0;
-  String _syncStatus = 'Synchronized';
+  bool _isConnected = false;
+  double _saveInterval = 2.0; // Alapértelmezett 2 másodperc
 
   final Map<String, Color> _dataColors = {
-    'PM1': CupertinoColors.systemOrange,
-    'PM2.5': CupertinoColors.systemRed,
-    'PM4': CupertinoColors.systemBrown,
-    'PM10': CupertinoColors.systemPurple,
-    'Humidity': CupertinoColors.systemBlue,
-    'Temp': CupertinoColors.systemGreen,
-    'VOC': CupertinoColors.systemYellow,
-    'NOx': CupertinoColors.systemGrey,
-    'CO2': CupertinoColors.systemIndigo,
-    'default': CupertinoColors.label,
+    'PM1': Colors.orange,
+    'PM2.5': Colors.red,
+    'PM4': Colors.brown,
+    'PM10': Colors.purple,
+    'Humidity': Colors.blue,
+    'Temp': Colors.green,
+    'VOC': Colors.yellow,
+    'NOx': Colors.grey,
+    'CO2': Colors.indigo,
+    'default': Colors.black,
   };
 
   @override
@@ -51,12 +50,29 @@ class _ViewControllerState extends State<ViewController> {
       developer.log('UI UPDATE received: $event');
       setState(() {
         if (event!.containsKey('ble_data')) {
-          _latestBLEData = event['ble_data'] ?? 'Searching...';
+          final newData = event['ble_data'] ?? 'Searching...';
 
-          if (_latestBLEData.isEmpty ||
-              _latestBLEData.contains('Searching') ||
-              (!_latestBLEData.contains('SEN55') && !_latestBLEData.contains('SEN66'))) {
-            _latestBLEData = 'Searching... (no connection)';
+          if (newData.isEmpty ||
+              newData.contains('Searching') ||
+              newData.contains('disconnected') ||
+              newData.contains('Reconnecting') ||
+              (!newData.contains('SEN55') && !newData.contains('SEN66') && !newData.contains('='))) {
+            _latestBLEData = 'Searching for device...';
+            _isConnected = false;
+          } else {
+            _latestBLEData = newData;
+            _isConnected = true;
+          }
+
+          if (_latestBLEData.contains('already stopped')) {
+            _latestBLEData = 'Waiting for location permission...';
+          }
+        }
+
+        if (event.containsKey('ble_connected')) {
+          _isConnected = event['ble_connected'];
+          if (!_isConnected) {
+            _latestBLEData = 'Device disconnected - Reconnecting...';
           }
         }
 
@@ -67,29 +83,28 @@ class _ViewControllerState extends State<ViewController> {
         if (event.containsKey('unsynced_count')) {
           _unsyncedCount = event['unsynced_count'];
         }
-
-        _updateSyncStatus();
       });
-    });
-
-    _service.isRunning().then((v) {
-      developer.log('ViewController: Background service is ${v ? "running" : "NOT running"}');
-      setState(() => _isServiceRunning = v);
-
-      if (!v) {
-        developer.log('ViewController: Attempting to restart background service...');
-        _service.startService();
-      }
     });
   }
 
-  void _updateSyncStatus() {
-    _syncStatus = _unsyncedCount == 0
-        ? 'Synchronized ${DateTime.now().toString().substring(11, 16)}'
-        : 'Offline - $_unsyncedCount data waiting';
+  // Az adatok beragadásának megoldása - reseteljük az adatokat kapcsolat megszakadáskor
+  void _resetDataOnDisconnect() {
+    if (!_isConnected) {
+      setState(() {
+        _latestBLEData = 'Searching for device...';
+      });
+    }
   }
 
   Map<String, double> _parseBleData(String rawData) {
+    if (!_isConnected ||
+        rawData.isEmpty ||
+        rawData.contains('Searching') ||
+        rawData.contains('disconnected') ||
+        (!rawData.contains('SEN55') && !rawData.contains('SEN66'))) {
+      return {};
+    }
+
     final cleaned = rawData.replaceFirst(RegExp(r'^[^:]*: '), '').trim();
     final entries = cleaned.split(', ');
     Map<String, double> parsed = {};
@@ -113,44 +128,58 @@ class _ViewControllerState extends State<ViewController> {
   }
 
   void _deleteDataButtonTapped() {
-    showCupertinoModalPopup(
+    showDialog(
       context: context,
-      builder: (BuildContext context) => CupertinoActionSheet(
+      builder: (BuildContext alertContext) => AlertDialog(
         title: const Text('Delete Data'),
-        message: const Text('Are you sure you want to delete all locally stored data?'),
+        content: const Text('Are you sure you want to delete all locally stored data?'),
         actions: [
-          CupertinoActionSheetAction(
+          TextButton(
+            onPressed: () => Navigator.pop(alertContext),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
             onPressed: () async {
-              Navigator.pop(context);
+              final NavigatorState navigator = Navigator.of(alertContext);
               final String databasesPath = await getDatabasesPath();
               final String path = p.join(databasesPath, 'mfk_sensor.db');
               await deleteDatabase(path);
               if (!mounted) return;
               _showAlert('All data deleted!');
-              _updateSyncStatus();
+              navigator.pop();
               setState(() => _unsyncedCount = 0);
             },
-            isDestructiveAction: true,
-            child: const Text('Delete'),
+            child: const Text(
+              'Delete',
+              style: TextStyle(color: Colors.red),
+            ),
           ),
         ],
-        cancelButton: CupertinoActionSheetAction(
-          onPressed: () => Navigator.pop(context),
-          child: const Text('Cancel'),
-        ),
       ),
     );
+  }
+
+  Future<void> _shareDataButtonTapped() async {
+    final List<AirQuality> allData = await _dbManager.getUnsynced();
+    final String fileText = allData.map((data) => '''
+Timestamp: ${data.timestamp} | Location: ${data.location}
+PM1.0: ${data.pm1_0}, PM2.5: ${data.pm2_5}, PM4.0: ${data.pm4_0}, PM10.0: ${data.pm10_0}
+Humidity: ${data.humidity}, Temp: ${data.temperature}, VOC: ${data.voc}, NOx: ${data.nox}, CO2: ${data.co2}
+''').join('\n\n');
+
+    final Directory directory = await getTemporaryDirectory();
+    final File file = File('${directory.path}/sensor_data_share.txt');
+    await file.writeAsString(fileText.isEmpty ? 'No data to share' : fileText);
+    Share.shareXFiles([XFile(file.path)], text: 'MFK Sensor Data');
   }
 
   void _showMapTapped() {
     Navigator.push(
       context,
-      CupertinoPageRoute(
-        builder: (context) => CupertinoPageScaffold(
-          navigationBar: const CupertinoNavigationBar(
-            middle: Text('Map'),
-          ),
-          child: WebViewWidget(
+      MaterialPageRoute(
+        builder: (context) => Scaffold(
+          appBar: AppBar(title: const Text('Map')),
+          body: WebViewWidget(
             controller: WebViewController()
               ..setJavaScriptMode(JavaScriptMode.unrestricted)
               ..loadRequest(Uri.parse('https://szaaat.github.io/mfksensor/map.html')),
@@ -161,13 +190,13 @@ class _ViewControllerState extends State<ViewController> {
   }
 
   void _showAlert(String message) {
-    showCupertinoDialog(
+    showDialog(
       context: context,
-      builder: (BuildContext context) => CupertinoAlertDialog(
+      builder: (BuildContext context) => AlertDialog(
         title: const Text('Information'),
         content: Text(message),
         actions: [
-          CupertinoDialogAction(
+          TextButton(
             onPressed: () => Navigator.pop(context),
             child: const Text('OK'),
           ),
@@ -176,313 +205,355 @@ class _ViewControllerState extends State<ViewController> {
     );
   }
 
-  Widget _createDataRow(String label, String value, {Color color = CupertinoColors.label}) {
-    return Container(
-      padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 16),
-      decoration: BoxDecoration(
-        border: Border(
-          bottom: BorderSide(color: CupertinoColors.separator, width: 0.5),
-        ),
-      ),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-        children: [
-          Text(
-            label,
-            style: const TextStyle(
-              fontSize: 16,
-              fontWeight: FontWeight.w500,
-              color: CupertinoColors.secondaryLabel,
-            ),
-          ),
-          Text(
-            value,
-            style: TextStyle(
-              fontSize: 18,
-              fontWeight: FontWeight.w600,
-              color: color,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _createStatusIndicator(String status, bool isActive) {
-    return Row(
-      mainAxisAlignment: MainAxisAlignment.center,
-      children: [
-        Icon(
-          isActive ? CupertinoIcons.checkmark_alt_circle_fill : CupertinoIcons.xmark_circle_fill,
-          color: isActive ? CupertinoColors.systemGreen : CupertinoColors.systemRed,
-          size: 16,
-        ),
-        const SizedBox(width: 6),
-        Text(
-          status,
-          style: TextStyle(
-            fontSize: 14,
-            color: isActive ? CupertinoColors.systemGreen : CupertinoColors.systemRed,
-            fontWeight: FontWeight.w500,
-          ),
-        ),
-      ],
-    );
-  }
-
-  // MANUAL SYNC button
-  Widget _createManualSyncButton() {
-    return CupertinoButton(
-      onPressed: () async {
-        developer.log('🔄 Manual sync triggered');
-        final dbManager = DatabaseManager();
-        final supabaseManager = SupabaseManager();
-        final unsynced = await dbManager.getUnsynced();
-        developer.log('📊 Manual sync: ${unsynced.length} records found');
-
-        if (unsynced.isNotEmpty) {
-          _showAlert('Sync started: ${unsynced.length} data');
-          await supabaseManager.syncData(unsynced);
-          final updatedUnsynced = await dbManager.getUnsynced();
-          setState(() {
-            _unsyncedCount = updatedUnsynced.length;
-            _updateSyncStatus();
-          });
-          _showAlert('Sync completed. Remaining: $_unsyncedCount data');
-        } else {
-          _showAlert('No unsynchronized data');
-        }
-      },
-      color: CupertinoColors.systemBlue,
-      child: const Text('Manual Sync'),
-    );
+  // Segédfüggvény a címkék rövidítésére
+  String _getShortLabel(String label) {
+    switch (label) {
+      case 'PM2.5':
+        return 'PM2.5';
+      case 'PM10.0':
+        return 'PM10';
+      case 'Humidity':
+        return 'Humid';
+      case 'Temperature':
+        return 'Temp';
+      case 'VOC':
+        return 'VOC';
+      case 'NOx':
+        return 'NOx';
+      case 'CO2':
+        return 'CO2';
+      default:
+        return label;
+    }
   }
 
   @override
   Widget build(BuildContext context) {
     final Map<String, double> parsedBle = _parseBleData(_latestBLEData);
-    final bool hasBLEData = parsedBle.isNotEmpty &&
-        _latestBLEData.contains('=') &&
-        (_latestBLEData.contains('SEN55') || _latestBLEData.contains('SEN66'));
-    final bool hasGPS = _latestLocation != 'No GPS data' && !_latestLocation.contains('Waiting');
+    final bool hasBLEData = parsedBle.isNotEmpty && _isConnected;
+    final bool isLandscape = MediaQuery.of(context).orientation == Orientation.landscape;
 
-    return CupertinoPageScaffold(
-      navigationBar: CupertinoNavigationBar(
-        // ELTÁVOLÍTVA: middle: Text('MFK Sensor'),
-        backgroundColor: CupertinoColors.systemBackground,
-        border: null,
-      ),
-      child: SafeArea(
-        child: Column(
-          children: [
-            // Top Logo
-            Container(
-              padding: const EdgeInsets.all(20),
-              child: Image.asset(
-                'assets/images/mfk_logo.png',
-                width: 200,
-                height: 50,
-                fit: BoxFit.contain,
-                errorBuilder: (context, error, stackTrace) =>
-                const SizedBox(height: 50, child: Center(child: Text('MFK Logo'))),
-              ),
-            ),
+    // Aktuális téma alapján színek
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final background = isDark ? Colors.black : Colors.grey[100];
+    final cardColor = isDark ? Colors.grey[900] : Colors.white;
+    final textColor = isDark ? Colors.white70 : Colors.black87;
+    final statusGood = isDark ? Colors.greenAccent[400] : Colors.green[700];
+    final statusWarn = isDark ? Colors.orangeAccent[200] : Colors.orange[700];
 
-            Expanded(
-              child: CustomScrollView(
-                slivers: [
-                  // Sensor Data Section
-                  SliverToBoxAdapter(
-                    child: Container(
-                      margin: const EdgeInsets.all(16),
-                      decoration: BoxDecoration(
-                        color: CupertinoColors.systemBackground,
-                        border: Border.all(color: CupertinoColors.separator, width: 0.5),
-                        borderRadius: BorderRadius.circular(12),
+    // Automatikus reset kapcsolat megszakadáskor
+    _resetDataOnDisconnect();
+
+    return Scaffold(
+      backgroundColor: background,
+      body: SafeArea(
+        child: Center(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                // Felső logó - kisebb
+                Image.asset(
+                  'assets/images/mfk_logo.png',
+                  height: isLandscape ? 35 : 50,
+                  fit: BoxFit.contain,
+                  color: isDark ? Colors.white70 : null,
+                  errorBuilder: (context, error, stackTrace) => Container(
+                    height: isLandscape ? 35 : 50,
+                    child: Center(
+                      child: Text(
+                        'MFK SENSOR',
+                        style: TextStyle(
+                          fontSize: 18,
+                          fontWeight: FontWeight.bold,
+                          color: textColor,
+                        ),
                       ),
-                      child: Column(
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 16),
+
+                // Kapcsolat állapot - kisebb
+                AnimatedContainer(
+                  duration: const Duration(milliseconds: 400),
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(
+                    color: _isConnected
+                        ? (isDark ? Colors.green.withOpacity(0.2) : Colors.green[100])
+                        : (isDark ? Colors.orange.withOpacity(0.2) : Colors.orange[100]),
+                    borderRadius: BorderRadius.circular(12),
+                    boxShadow: [
+                      BoxShadow(
+                        color: Colors.black26,
+                        blurRadius: 4,
+                        offset: const Offset(0, 2),
+                      ),
+                    ],
+                  ),
+                  child: Text(
+                    _isConnected ? '✅ Connected to Sensor' : '🔄 Searching for Sensor...',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.bold,
+                      color: _isConnected ? statusGood : statusWarn,
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 20),
+
+                // Küldés sűrűségének beállítása
+                Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: cardColor,
+                    borderRadius: BorderRadius.circular(12),
+                    boxShadow: [
+                      BoxShadow(
+                        color: isDark ? Colors.black45 : Colors.black12,
+                        blurRadius: 4,
+                        offset: const Offset(0, 2),
+                      )
+                    ],
+                  ),
+                  child: Column(
+                    children: [
+                      Text(
+                        'Data Collection Interval',
+                        style: TextStyle(
+                          fontSize: 16,
+                          fontWeight: FontWeight.w600,
+                          color: textColor,
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceEvenly,
                         children: [
-                          // Status indicators
-                          Container(
-                            padding: const EdgeInsets.all(16),
-                            child: Row(
-                              mainAxisAlignment: MainAxisAlignment.spaceAround,
-                              children: [
-                                _createStatusIndicator('GPS', hasGPS),
-                                _createStatusIndicator('Bluetooth', hasBLEData),
-                                _createStatusIndicator('Service', _isServiceRunning),
-                              ],
-                            ),
-                          ),
+                          _buildIntervalButton(2, '2s'),
+                          _buildIntervalButton(10, '10s'),
+                          _buildIntervalButton(60, '60s'),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 20),
 
-                          // Bluetooth connection status
-                          if (!hasBLEData)
-                            Container(
-                              padding: const EdgeInsets.all(16),
-                              child: Text(
-                                'Bluetooth connecting...',
-                                style: TextStyle(
-                                  fontSize: 16,
-                                  color: CupertinoColors.systemOrange,
-                                  fontWeight: FontWeight.w500,
-                                ),
-                                textAlign: TextAlign.center,
-                              ),
-                            ),
+                // Szenzoradatok - kisebb dobozokkal
+                if (hasBLEData)
+                  LayoutBuilder(
+                    builder: (context, constraints) {
+                      final crossAxisCount = isLandscape ? 4 : 3;
+                      final childAspectRatio = isLandscape ? 0.9 : 0.8;
 
-                          // Sensor data rows
-                          if (hasBLEData) ...[
-                            _createDataRow('PM1.0', '${parsedBle['PM1']?.toStringAsFixed(1) ?? '0.0'}', color: _dataColors['PM1']!),
-                            _createDataRow('PM2.5', '${parsedBle['PM2.5']?.toStringAsFixed(1) ?? '0.0'}', color: _dataColors['PM2.5']!),
-                            _createDataRow('PM4.0', '${parsedBle['PM4']?.toStringAsFixed(1) ?? '0.0'}', color: _dataColors['PM4']!),
-                            _createDataRow('PM10.0', '${parsedBle['PM10']?.toStringAsFixed(1) ?? '0.0'}', color: _dataColors['PM10']!),
-                            _createDataRow('Humidity', '${parsedBle['Humidity']?.toStringAsFixed(1) ?? '0.0'}%', color: _dataColors['Humidity']!),
-                            _createDataRow('Temperature', '${parsedBle['Temp']?.toStringAsFixed(1) ?? '0.0'}°C', color: _dataColors['Temp']!),
-                            _createDataRow('VOC', '${parsedBle['VOC']?.toStringAsFixed(1) ?? '0.0'}', color: _dataColors['VOC']!),
-                            _createDataRow('NOx', '${parsedBle['NOx']?.toStringAsFixed(1) ?? '0.0'}', color: _dataColors['NOx']!),
-                            if (parsedBle.containsKey('CO2') && parsedBle['CO2']! > 0)
-                              _createDataRow('CO2', '${parsedBle['CO2']?.toStringAsFixed(1) ?? '0.0'}', color: _dataColors['CO2']!),
-                          ],
-
-                          // Sync status
-                          Container(
-                            padding: const EdgeInsets.all(16),
+                      return GridView.count(
+                        crossAxisCount: crossAxisCount,
+                        crossAxisSpacing: 6,
+                        mainAxisSpacing: 6,
+                        shrinkWrap: true,
+                        physics: const NeverScrollableScrollPhysics(),
+                        childAspectRatio: childAspectRatio,
+                        children: parsedBle.entries.map((entry) {
+                          final color = _dataColors[entry.key] ?? _dataColors['default']!;
+                          return Container(
                             decoration: BoxDecoration(
-                              color: CupertinoColors.secondarySystemBackground,
-                              borderRadius: const BorderRadius.only(
-                                bottomLeft: Radius.circular(12),
-                                bottomRight: Radius.circular(12),
-                              ),
+                              color: cardColor,
+                              borderRadius: BorderRadius.circular(10),
+                              boxShadow: [
+                                BoxShadow(
+                                  color: isDark ? Colors.black45 : Colors.black12,
+                                  blurRadius: 3,
+                                  offset: const Offset(0, 1),
+                                )
+                              ],
                             ),
+                            padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 4),
                             child: Column(
+                              mainAxisAlignment: MainAxisAlignment.center,
                               children: [
-                                Row(
-                                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                                  children: [
-                                    const Text('Saved measurements:'),
-                                    Text(
-                                      '$_unsyncedCount',
-                                      style: const TextStyle(fontWeight: FontWeight.w600),
-                                    ),
-                                  ],
+                                Text(
+                                  _getShortLabel(entry.key),
+                                  style: TextStyle(
+                                    fontSize: 11,
+                                    fontWeight: FontWeight.bold,
+                                    color: color,
+                                  ),
+                                  textAlign: TextAlign.center,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
                                 ),
-                                const SizedBox(height: 8),
-                                Row(
-                                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                                  children: [
-                                    const Text('Sync status:'),
-                                    Text(
-                                      _syncStatus,
-                                      style: TextStyle(
-                                        color: _unsyncedCount == 0
-                                            ? CupertinoColors.systemGreen
-                                            : CupertinoColors.systemOrange,
-                                        fontWeight: FontWeight.w600,
-                                      ),
-                                    ),
-                                  ],
+                                const SizedBox(height: 4),
+                                Text(
+                                  entry.value.toStringAsFixed(1),
+                                  style: TextStyle(
+                                    fontSize: 24,
+                                    fontWeight: FontWeight.w600,
+                                    color: textColor,
+                                  ),
                                 ),
                               ],
                             ),
-                          ),
-                        ],
+                          );
+                        }).toList(),
+                      );
+                    },
+                  )
+                else
+                  Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: Text(
+                      _isConnected ? 'Processing sensor data...' : 'Waiting for sensor connection...',
+                      style: TextStyle(
+                        fontSize: 16,
+                        fontStyle: FontStyle.italic,
+                        color: textColor.withOpacity(0.7),
                       ),
+                      textAlign: TextAlign.center,
                     ),
                   ),
 
-                  // Data Collection Frequency - CENTERED
-                  SliverToBoxAdapter(
-                    child: Container(
-                      margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 20),
-                      padding: const EdgeInsets.all(16),
-                      decoration: BoxDecoration(
-                        color: CupertinoColors.systemBackground,
-                        border: Border.all(color: CupertinoColors.separator, width: 0.5),
-                        borderRadius: BorderRadius.circular(12),
-                      ),
-                      child: Column(
-                        children: [
-                          const Text(
-                            'Data Collection Frequency',
-                            style: TextStyle(
-                              fontSize: 18,
-                              fontWeight: FontWeight.w600,
-                            ),
+                const SizedBox(height: 16),
+
+                // Gombok - kisebbek
+                if (hasBLEData) ...[
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      ElevatedButton.icon(
+                        onPressed: _showMapTapped,
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.green,
+                          foregroundColor: Colors.white,
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(10),
                           ),
-                          const SizedBox(height: 16),
-                          CupertinoSlidingSegmentedControl<double>(
-                            groupValue: _saveInterval,
-                            children: {
-                              2.0: const Text('Car\n(2s)'),
-                              10.0: const Text('Bike\n(10s)'),
-                              60.0: const Text('Walk\n(60s)'),
-                            },
-                            onValueChanged: (value) {
-                              if (value != null) {
-                                _setSaveInterval(value);
-                              }
-                            },
-                          ),
-                        ],
+                          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                        ),
+                        icon: const Icon(Icons.map, size: 16),
+                        label: const Text('Map', style: TextStyle(fontSize: 12)),
                       ),
+                      const SizedBox(width: 8),
+                      ElevatedButton.icon(
+                        onPressed: _shareDataButtonTapped,
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.orange,
+                          foregroundColor: Colors.white,
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(10),
+                          ),
+                          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                        ),
+                        icon: const Icon(Icons.share, size: 16),
+                        label: const Text('Share', style: TextStyle(fontSize: 12)),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  ElevatedButton.icon(
+                    onPressed: _deleteDataButtonTapped,
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.red,
+                      foregroundColor: Colors.white,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
                     ),
+                    icon: const Icon(Icons.delete, size: 16),
+                    label: const Text('Delete Data', style: TextStyle(fontSize: 12)),
                   ),
-
-                  // Buttons section
-                  SliverToBoxAdapter(
-                    child: Container(
-                      padding: const EdgeInsets.all(16),
-                      child: Column(
-                        children: [
-                          // Manual Sync button
-                          _createManualSyncButton(),
-                          const SizedBox(height: 12),
-
-                          // Map button
-                          SizedBox(
-                            width: double.infinity,
-                            child: CupertinoButton.filled(
-                              onPressed: _showMapTapped,
-                              child: const Text('Open Map'),
-                            ),
-                          ),
-                          const SizedBox(height: 12),
-
-                          // Delete Data button
-                          SizedBox(
-                            width: double.infinity,
-                            child: CupertinoButton(
-                              color: CupertinoColors.systemRed,
-                              onPressed: _deleteDataButtonTapped,
-                              child: const Text('Delete Data'),
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ),
-
-                  // Bottom spacing for EMNL logo
-                  const SliverToBoxAdapter(
-                    child: SizedBox(height: 80),
-                  ),
+                  const SizedBox(height: 16),
                 ],
-              ),
-            ),
 
-            // Bottom EMNL Logo - FIXED AT BOTTOM
-            Container(
-              padding: const EdgeInsets.all(20),
-              child: Image.asset(
-                'assets/images/emnl_logo.png',
-                width: 200,
-                height: 50,
-                fit: BoxFit.contain,
-                errorBuilder: (context, error, stackTrace) =>
-                const SizedBox(height: 50, child: Center(child: Text('EMNL Logo'))),
-              ),
+                // Szinkronizálási információ - kisebb
+                Container(
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(
+                    color: cardColor,
+                    borderRadius: BorderRadius.circular(10),
+                    boxShadow: [
+                      BoxShadow(
+                        color: isDark ? Colors.black45 : Colors.black12,
+                        blurRadius: 3,
+                        offset: const Offset(0, 1),
+                      )
+                    ],
+                  ),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Icon(
+                        _unsyncedCount == 0 ? Icons.cloud_done : Icons.cloud_upload,
+                        color: _unsyncedCount == 0 ? Colors.green : Colors.orange,
+                        size: 16,
+                      ),
+                      const SizedBox(width: 6),
+                      Text(
+                        _unsyncedCount == 0 ? 'All data synced' : '$_unsyncedCount waiting',
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: textColor,
+                          fontWeight: FontWeight.w500,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+
+                const SizedBox(height: 30),
+
+                // Alsó logó - kisebb
+                Image.asset(
+                  'assets/images/emnl_logo.png',
+                  height: isLandscape ? 35 : 40,
+                  fit: BoxFit.contain,
+                  color: isDark ? Colors.white70 : null,
+                  errorBuilder: (context, error, stackTrace) => Container(
+                    height: isLandscape ? 35 : 40,
+                    child: Center(
+                      child: Text(
+                        'EMNL',
+                        style: TextStyle(
+                          fontSize: 14,
+                          fontWeight: FontWeight.bold,
+                          color: textColor,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ],
             ),
-          ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  // Intervallum gomb építése
+  Widget _buildIntervalButton(int seconds, String label) {
+    final isSelected = _saveInterval == seconds;
+    return GestureDetector(
+      onTap: () => _setSaveInterval(seconds.toDouble()),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        decoration: BoxDecoration(
+          color: isSelected
+              ? (Theme.of(context).brightness == Brightness.dark ? Colors.blue[700] : Colors.blue)
+              : (Theme.of(context).brightness == Brightness.dark ? Colors.grey[800] : Colors.grey[300]),
+          borderRadius: BorderRadius.circular(8),
+          border: isSelected ? Border.all(color: Colors.blueAccent, width: 2) : null,
+        ),
+        child: Text(
+          label,
+          style: TextStyle(
+            fontSize: 12,
+            fontWeight: FontWeight.w600,
+            color: isSelected ? Colors.white : Theme.of(context).brightness == Brightness.dark ? Colors.white70 : Colors.black87,
+          ),
         ),
       ),
     );

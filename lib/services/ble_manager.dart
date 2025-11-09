@@ -1,50 +1,60 @@
+// lib/services/ble_manager.dart
+
 import 'dart:async';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'dart:developer' as developer;
 
+// =========================================================================
+// KEZDŐDIK A TELJES, ÚJ, ROBOSZTUS OSZTÁLY
+// =========================================================================
 class BLEManager {
   static final BLEManager _instance = BLEManager._internal();
+
   factory BLEManager() => _instance;
 
   BLEManager._internal() {
-    FlutterBluePlus.scanResults.listen((results) {
-      if (_isPeriodicScanningActive && _connectedDevice == null) {
-        for (ScanResult result in results) {
-          _handleDiscoveredDevice(result);
-        }
-      }
-    });
-
-    // ⭐️ ELTÁVOLÍTVA: FlutterBluePlus.connectionState - nem létezik
-    // Ehelyett az egyes eszközök connectionState streamjét használjuk
+    // Ezt a részt egyszerűsíthetjük, mert a _periodicScan kezeli a logikát
   }
 
+  // Meglévő és új állapotváltozók
   BluetoothDevice? _connectedDevice;
-  bool _isConnecting = false;
+  bool _isPeriodicScanningActive = false;
+  bool _isReconnecting = false;
+  int _reconnectAttempts = 0;
+  static const int maxReconnectAttempts = 5;
+  Timer? _reconnectTimer;
 
-  final StreamController<String> _dataController = StreamController<String>.broadcast();
-  final StreamController<void> _disconnectController = StreamController<void>.broadcast();
+  // Stream Controllerek
+  final StreamController<String> _dataController = StreamController<
+      String>.broadcast();
+  final StreamController<void> _disconnectController = StreamController<
+      void>.broadcast();
 
   Stream<String> get onDataReceived => _dataController.stream;
+
   Stream<void> get onDisconnected => _disconnectController.stream;
 
+  // UUIDs
   final Guid sen66ServiceUUID = Guid("12345678-1234-1234-1234-123456789abc");
-  final Guid sen66CharacteristicUUID = Guid("87654321-4321-4321-4321-cba987654321");
+  final Guid sen66CharacteristicUUID = Guid(
+      "87654321-4321-4321-4321-cba987654321");
   final Guid sen55ServiceUUID = Guid("0000181a-0000-1000-8000-00805f9b34fb");
 
-  bool _isPeriodicScanningActive = false;
+  // ================================================================
+  // NYILVÁNOS METÓDUSOK
+  // ================================================================
 
   Future<void> startScanning() async {
     developer.log('BLEManager: startScanning called');
-
     if (!await _checkBluetoothState()) return;
-
     _isPeriodicScanningActive = true;
     _periodicScan();
   }
 
   Future<void> stopScanning() async {
     _isPeriodicScanningActive = false;
+    _reconnectTimer?.cancel();
+    _isReconnecting = false;
     await FlutterBluePlus.stopScan();
 
     if (_connectedDevice != null) {
@@ -54,199 +64,225 @@ class BLEManager {
     developer.log('BLEManager: Scanning stopped completely');
   }
 
+  Future<void> forceReconnect() async {
+    developer.log('🔄 BLEManager: Manual reconnect triggered');
+    if (_connectedDevice != null) {
+      await _connectedDevice!.disconnect();
+    }
+    await Future.delayed(const Duration(milliseconds: 500));
+    _handleDisconnection(); // Ez elindítja az újracsatlakozási folyamatot
+  }
+
   void dispose() {
+    _reconnectTimer?.cancel();
     _dataController.close();
     _disconnectController.close();
   }
 
-  Future<void> _periodicScan() async {
-    while (_isPeriodicScanningActive && _connectedDevice == null) {
-      developer.log('BLEManager: Starting a new scan cycle...');
+  // ================================================================
+  // BELSŐ (PRIVATE) METÓDUSOK
+  // ================================================================
 
+  Future<void> _periodicScan() async {
+    developer.log('BLEManager: Starting robust periodic scanning...');
+    while (_isPeriodicScanningActive && _connectedDevice == null) {
       try {
+        developer.log('BLEManager: Starting scan cycle...');
+        await FlutterBluePlus.stopScan();
+        await Future.delayed(const Duration(milliseconds: 500));
+
+        if (!await _checkBluetoothState()) {
+          developer.log('❌ BLEManager: Bluetooth not available, waiting...');
+          await Future.delayed(const Duration(seconds: 5));
+          continue;
+        }
+
         await FlutterBluePlus.startScan(
-          timeout: const Duration(seconds: 6),
+          timeout: const Duration(seconds: 8),
           withServices: [sen55ServiceUUID, sen66ServiceUUID],
         );
+        developer.log('BLEManager: Scan started, waiting for results...');
 
-        await Future.delayed(const Duration(seconds: 6));
-        await FlutterBluePlus.stopScan();
+        bool deviceFound = false;
+        final subscription = FlutterBluePlus.scanResults.listen((results) {
+          for (ScanResult result in results) {
+            final name = result.device.platformName;
+            if (name.contains('SEN55') || name.contains('SEN66')) {
+              if (deviceFound) return; // Már találtunk egyet ebben a ciklusban
+              developer.log('🎯 BLEManager: Target device found: $name');
+              deviceFound = true;
+              _isPeriodicScanningActive =
+              false; // Leállítjuk a további ciklusokat
+              FlutterBluePlus.stopScan();
+              _connectToDevice(result.device);
+              return;
+            }
+          }
+        });
 
+        await Future.delayed(const Duration(seconds: 8 + 1));
+        await subscription.cancel(); // Mindig leiratkozunk a végén
+
+        if (!deviceFound) {
+          developer.log('🔍 BLEManager: No target devices found in this cycle');
+        }
+
+        if (_isPeriodicScanningActive && _connectedDevice == null) {
+          await Future.delayed(const Duration(seconds: 2));
+        }
       } catch (e) {
-        developer.log('BLEManager: Scan error: $e');
-      }
-
-      if (_isPeriodicScanningActive && _connectedDevice == null) {
-        developer.log('BLEManager: Scan finished, waiting before next cycle...');
-        await Future.delayed(const Duration(seconds: 5));
+        developer.log('❌ BLEManager: Scan cycle error: $e');
+        await Future.delayed(const Duration(seconds: 3));
       }
     }
     developer.log('BLEManager: Periodic scanning stopped.');
   }
 
   Future<bool> _checkBluetoothState() async {
+    // ... (ez a metódus maradhat a régiben, már elég robusztus)
     int retryCount = 0;
-    const maxRetries = 5;
+    const maxRetries = 10;
     BluetoothAdapterState state = await FlutterBluePlus.adapterState.first;
 
     while (state == BluetoothAdapterState.unknown && retryCount < maxRetries) {
-      developer.log('BLEManager: Bluetooth state unknown, retrying... (${retryCount + 1}/$maxRetries)');
-      await Future.delayed(const Duration(seconds: 2));
+      developer.log(
+          'BLEManager: Bluetooth state unknown, retrying... (${retryCount +
+              1}/$maxRetries)');
+      await Future.delayed(const Duration(seconds: 3));
       state = await FlutterBluePlus.adapterState.first;
       retryCount++;
     }
 
     if (state != BluetoothAdapterState.on) {
       developer.log('BLEManager: Bluetooth not available: $state');
-      Future.delayed(const Duration(seconds: 10), startScanning);
       return false;
     }
-
     developer.log('BLEManager: Bluetooth is ON');
     return true;
   }
 
-  void _handleDiscoveredDevice(ScanResult result) {
-    if (_isConnecting || _connectedDevice != null) return;
-
-    final device = result.device;
-    final name = device.platformName.isEmpty ? 'N/A' : device.platformName;
-
-    if (name.contains('SEN55') || name.contains('SEN66')) {
-      developer.log('🎯 BLEManager: Target device found: $name');
-      _isPeriodicScanningActive = false;
-      FlutterBluePlus.stopScan();
-      _connectToDevice(device);
-    }
-  }
-
   Future<void> _connectToDevice(BluetoothDevice device) async {
-    if (_isConnecting) return;
+    developer.log(
+        '🔗 BLEManager: Attempting to connect to ${device.platformName}');
 
-    _isConnecting = true;
+    // A listen subscription-t egy változóba mentjük, hogy később lemondhassuk
+    StreamSubscription<BluetoothConnectionState>? connectionSubscription;
+
+    connectionSubscription =
+        device.connectionState.listen((BluetoothConnectionState state) async {
+          developer.log(
+              '🔗 BLEManager: Connection state changed: $state for ${device
+                  .remoteId}');
+          if (state == BluetoothConnectionState.disconnected) {
+            await connectionSubscription?.cancel();
+            _handleDisconnection();
+          } else if (state == BluetoothConnectionState.connected) {
+            developer.log('✅ BLEManager: Successfully connected to device');
+            _isReconnecting = false;
+            _reconnectAttempts = 0;
+            _reconnectTimer?.cancel();
+          }
+        });
 
     try {
-      // Először szakítsuk meg a régi kapcsolatot, ha van
-      if (_connectedDevice != null) {
-        await _connectedDevice!.disconnect();
-        await Future.delayed(const Duration(milliseconds: 500));
-      }
-
       _connectedDevice = device;
-
-      developer.log('🔗 BLEManager: Attempting to connect to: ${device.platformName}');
-
-      // ⭐️ Rövid timeout és autoConnect=true a megbízhatóbb kapcsolódáshoz
       await device.connect(
-          autoConnect: true,
-          timeout: const Duration(seconds: 8)
+          autoConnect: false, timeout: const Duration(seconds: 20)); // A 'connect' metódus Duration-t vár, ez jó!
+      developer.log('✅ BLEManager: Connected to: ${device.platformName}');
+
+      // JAVÍTÁS: A discoverServices 'int' másodpercet vár, nem Duration-t.
+      List<BluetoothService> services = await device.discoverServices(
+          timeout: 15 // <-- Így már helyes!
       );
+      developer.log('✅ BLEManager: Discovered ${services.length} services');
 
-      developer.log('✅ BLEManager: Successfully connected to: ${device.platformName}');
-
-      // Szolgáltatások felfedezése
-      List<BluetoothService> services = await device.discoverServices();
-      developer.log('🔍 BLEManager: Discovered ${services.length} services');
-
-      bool foundCharacteristics = false;
       for (BluetoothService service in services) {
         await _discoverCharacteristics(service);
-        foundCharacteristics = true;
       }
-
-      if (!foundCharacteristics) {
-        developer.log('⚠️ BLEManager: No characteristics found, disconnecting...');
-        await device.disconnect();
-        throw Exception('No characteristics found');
-      }
-
-      // ⭐️ ERŐSÍTETT kapcsolat állapot figyelése - CSAK az eszköz szintjén
-      device.connectionState.listen((BluetoothConnectionState state) async {
-        developer.log('🔗 BLEManager: Connection state changed to: $state for ${device.platformName}');
-
-        if (state == BluetoothConnectionState.disconnected) {
-          developer.log('🔌 BLEManager: Device disconnected, handling disconnection...');
-          await Future.delayed(const Duration(milliseconds: 100));
-          _handleDisconnection();
-        }
-      });
-
-      _isConnecting = false;
-
     } catch (e) {
       developer.log('❌ BLEManager: Connection error: $e');
-      _isConnecting = false;
+      await connectionSubscription.cancel();
       _handleDisconnection();
     }
   }
 
   Future<void> _discoverCharacteristics(BluetoothService service) async {
+    // ... (ez a metódus változatlan maradhat)
     for (BluetoothCharacteristic characteristic in service.characteristics) {
-      if (characteristic.properties.notify || characteristic.properties.read) {
-        developer.log('📡 BLEManager: Setting up notifications for: ${characteristic.uuid}');
-        await _setupNotifications(characteristic);
+      if (characteristic.properties.notify) {
+        await _setupCharacteristicNotifications(characteristic);
       }
     }
   }
 
-  Future<void> _setupNotifications(BluetoothCharacteristic characteristic) async {
-    try {
-      await characteristic.setNotifyValue(true);
-      characteristic.value.listen((value) {
-        if (value.isNotEmpty) {
-          try {
-            final dataString = String.fromCharCodes(value).trim();
-            if (dataString.isNotEmpty && dataString.contains('=')) {
-              final deviceName = _connectedDevice?.platformName ?? 'Unknown';
-              final taggedData = '$deviceName: $dataString';
-              developer.log('📱 BLE Raw Data: $taggedData');
-              _dataController.add(taggedData);
-            }
-          } catch (e) {
-            developer.log('❌ BLE Parse error: $e');
+  Future<void> _setupCharacteristicNotifications(
+      BluetoothCharacteristic characteristic) async {
+    // ... (ez a metódus változatlan maradhat)
+    await characteristic.setNotifyValue(true);
+    characteristic.value.listen((value) {
+      if (value.isNotEmpty) {
+        try {
+          final dataString = String.fromCharCodes(value).trim();
+          if (dataString.isNotEmpty && dataString.contains('=')) {
+            final deviceName = _connectedDevice?.platformName ?? 'Unknown';
+            final taggedData = '$deviceName: $dataString';
+            developer.log('BLE Raw Data: $taggedData');
+            _dataController.add(taggedData);
           }
+        } catch (e) {
+          developer.log('BLE Parse error: $e');
         }
-      });
-      developer.log('✅ BLEManager: Notifications set up for ${characteristic.uuid}');
-    } catch (e) {
-      developer.log('❌ BLEManager: Error setting up notifications: $e');
-    }
-  }
-
-  void _handleDisconnection() async {
-    if (!_isPeriodicScanningActive) return;
-
-    developer.log('🔄 BLEManager: Starting disconnection handling...');
-
-    // Küldjünk üres adatot a felhasználói felület számára
-    _dataController.add('');
-    _disconnectController.add(null);
-
-    // Eszköz leválasztása, ha még nem történt meg
-    if (_connectedDevice != null) {
-      try {
-        await _connectedDevice!.disconnect();
-        developer.log('✅ BLEManager: Device disconnected successfully');
-      } catch (e) {
-        developer.log('⚠️ BLEManager: Error during disconnection: $e');
       }
-      _connectedDevice = null;
-    }
-
-    _isConnecting = false;
-
-    // ⭐️ RÖVID VÁRAKOZÁS, MAJD AZONNALI ÚJRAINDULÁS
-    await Future.delayed(const Duration(seconds: 2));
-
-    if (_isPeriodicScanningActive) {
-      developer.log('🔄 BLEManager: Restarting scan after disconnection...');
-      startScanning();
-    }
+    });
   }
 
-  // ⭐️ MANUÁLIS ÚJRAKAPCSOLÓDÁS
-  Future<void> reconnect() async {
-    developer.log('🔄 BLEManager: Manual reconnect requested');
-    _handleDisconnection();
+  // ================================================================
+  // MÓDOSÍTOTT DISCONNECT KEZELÉS
+  // ================================================================
+
+  void _handleDisconnection() {
+    if (_isReconnecting) return; // Már folyamatban van az újracsatlakozás
+
+    developer.log(
+        'BLEManager: Device disconnected - starting reconnection process');
+    _disconnectController.add(null);
+    _dataController.add('');
+    _connectedDevice = null;
+    _isPeriodicScanningActive = true;
+
+    _startReconnectionProcess();
+  }
+
+  void _startReconnectionProcess() {
+    _isReconnecting = true;
+    _reconnectAttempts = 0;
+    developer.log('🔄 BLEManager: Starting automated reconnection process');
+
+    _reconnectTimer?.cancel(); // Biztonsági leállítás
+    _reconnectTimer =
+        Timer.periodic(const Duration(seconds: 10), (timer) async {
+          if (!_isReconnecting || _reconnectAttempts >= maxReconnectAttempts) {
+            developer.log(
+                '🔄 BLEManager: Stopping reconnection attempts after $maxReconnectAttempts tries.');
+            timer.cancel();
+            _isReconnecting = false;
+            return;
+          }
+
+          _reconnectAttempts++;
+          developer.log(
+              '🔄 BLEManager: Reconnection attempt $_reconnectAttempts/$maxReconnectAttempts');
+
+          // Újraindítjuk a teljes keresési folyamatot
+          await _periodicScan();
+
+          // Ha a periodicScan sikeresen csatlakozott, állítsuk le az újracsatlakozást
+          if (_connectedDevice != null) {
+            developer.log('✅ BLEManager: Reconnection successful!');
+            timer.cancel();
+            _isReconnecting = false;
+            _reconnectAttempts = 0;
+          }
+        });
   }
 }

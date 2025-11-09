@@ -14,6 +14,7 @@ class LocationManager {
   Stream<LocationServiceStatus> get onStatusChanged => _statusController.stream;
   Stream<String> get onError => _errorController.stream;
 
+  // GETTER az utolsó ismert helyhez
   Position? get lastKnownLocation => _latestLocation;
 
   LocationManager() {
@@ -27,22 +28,13 @@ class LocationManager {
 
   Future<void> _requestPermission() async {
     LocationPermission permission = await Geolocator.checkPermission();
-
     if (permission == LocationPermission.denied) {
       permission = await Geolocator.requestPermission();
-      developer.log('LocationManager: Permission requested: $permission');
     }
 
     if (permission == LocationPermission.deniedForever) {
       _errorController.add('Location permissions are permanently denied');
-      developer.log('LocationManager: Location permissions permanently denied');
       return;
-    }
-
-    if (permission == LocationPermission.whileInUse || permission == LocationPermission.always) {
-      developer.log('LocationManager: Location permission granted: $permission');
-    } else {
-      developer.log('LocationManager: Location permission not granted: $permission');
     }
   }
 
@@ -53,36 +45,19 @@ class LocationManager {
       _isGPSActive = true;
       _statusController.add(LocationServiceStatus.active);
 
-      // Először próbáljunk meg egy azonnali pozíciót kapni
-      try {
-        Position position = await Geolocator.getCurrentPosition(
-          desiredAccuracy: LocationAccuracy.best,
-          timeLimit: Duration(seconds: 10),
-        );
-        _updateLocation(position);
-        developer.log('LocationManager: Initial position acquired');
-      } catch (e) {
-        developer.log('LocationManager: Error getting initial position: $e');
-      }
-
-      // Folyamatos frissítések
-      Geolocator.getPositionStream(
-        locationSettings: LocationSettings(
-          accuracy: LocationAccuracy.best,
-          distanceFilter: 1, // 1 méter változásra frissít
-        ),
-      ).listen(
-        _updateLocation,
-        onError: (error) {
-          developer.log('LocationManager: Location stream error: $error');
-          _errorController.add(error.toString());
-          _isGPSActive = false;
-          _statusController.add(LocationServiceStatus.error);
-        },
-        cancelOnError: false,
+      // Azonnali pozíció lekérése
+      Position position = await Geolocator.getCurrentPosition(
+        desiredAccuracy: LocationAccuracy.best,
       );
+      _updateLocation(position);
 
-      developer.log('LocationManager: Location updates started successfully');
+      // Folyamatos frissítések - gyakoribb frissítéssel
+      Geolocator.getPositionStream(
+        locationSettings: const LocationSettings(
+          accuracy: LocationAccuracy.bestForNavigation, // Pontosabb
+          distanceFilter: 1, // Csak 1 méter változásra
+        ),
+      ).listen(_updateLocation);
 
     } catch (e) {
       developer.log('LocationManager: Error starting location updates: $e');

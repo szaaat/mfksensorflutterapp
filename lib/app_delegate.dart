@@ -1,4 +1,4 @@
-import 'package:flutter/cupertino.dart';
+import 'package:flutter/material.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:permission_handler/permission_handler.dart';
 
@@ -17,7 +17,6 @@ class AppDelegate {
     await Permission.bluetoothScan.request();
     await Permission.bluetoothConnect.request();
     await Permission.notification.request();
-    await Permission.sensors.request();
   }
 
   static Future<void> _initializeNotifications() async {

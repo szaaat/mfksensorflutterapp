@@ -6,7 +6,7 @@ import 'dart:developer' as developer;
 class AirQuality {
   int? id;
   String timestamp;
-  String location;
+  String location; // ÚJ: POINT(longitude latitude)
   double pm1_0;
   double pm2_5;
   double pm4_0;
@@ -93,7 +93,7 @@ class DatabaseManager {
           CREATE TABLE air_quality (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp TEXT NOT NULL,
-            location TEXT NOT NULL,
+            location TEXT NOT NULL,  -- ÚJ: location TEXT
             pm1_0 REAL,
             pm2_5 REAL,
             pm4_0 REAL,
@@ -112,36 +112,8 @@ class DatabaseManager {
 
   Future<int> insert(AirQuality data) async {
     final dbClient = await db;
-
-    // ⭐️ ADAT ÉRVÉNYESSÉGI ELLENŐRZÉS
-    if (data.timestamp.isEmpty) {
-      data.timestamp = DateTime.now().toIso8601String();
-      developer.log('⚠️ DatabaseManager: Empty timestamp, using current time');
-    }
-
-    if (data.location.isEmpty) {
-      data.location = 'POINT(0 0)';
-      developer.log('⚠️ DatabaseManager: Empty location, using default');
-    }
-
-    // ⭐️ NUMERIKUS ÉRTÉKEK ELLENŐRZÉSE
-    final numericFields = [data.pm1_0, data.pm2_5, data.pm4_0, data.pm10_0, data.humidity, data.temperature, data.voc, data.nox, data.co2];
-    for (var value in numericFields) {
-      if (value.isNaN || value.isInfinite) {
-        developer.log('⚠️ DatabaseManager: Invalid numeric value detected: $value');
-      }
-    }
-
-    try {
-      final int id = await dbClient.insert('air_quality', data.toMap());
-      developer.log('💾 DatabaseManager: Data saved with ID: $id');
-      return id;
-    } catch (e) {
-      developer.log('❌ DatabaseManager: Insert error: $e');
-      rethrow;
-    }
+    return await dbClient.insert('air_quality', data.toMap());
   }
-
 
   Future<List<AirQuality>> getUnsynced() async {
     final dbClient = await db;
@@ -150,39 +122,57 @@ class DatabaseManager {
       where: 'uploaded = ?',
       whereArgs: [0],
     );
-
-    developer.log('📊 DatabaseManager: Found ${maps.length} unsynced records');
-
-    if (maps.isNotEmpty) {
-      for (var i = 0; i < (maps.length < 3 ? maps.length : 3); i++) {
-        final map = maps[i];
-        developer.log('📄 DatabaseManager: Unsynced record ${i + 1} - ID: ${map['id']}, Time: ${map['timestamp']}');
-      }
-    } else {
-      developer.log('📊 DatabaseManager: No unsynced records found');
-    }
-
     return maps.map((map) => AirQuality.fromMap(map)).toList();
   }
 
   Future<void> markAsUploaded(List<int> ids) async {
     if (ids.isEmpty) return;
+
     final dbClient = await db;
-    await dbClient.transaction((txn) async {
-      await txn.update(
-        'air_quality',
-        {'uploaded': 1},
-        where: 'id IN (${ids.map((_) => '?').join(', ')})',
-        whereArgs: ids,
-      );
-    });
+    try {
+      // JAVÍTOTT: használjunk rawQuery-t vagy a megfelelő update szintaxist
+      final placeholders = List.filled(ids.length, '?').join(',');
+      await dbClient.rawUpdate('''
+      UPDATE air_quality 
+      SET uploaded = 1 
+      WHERE id IN ($placeholders)
+    ''', ids);
+
+      developer.log('DatabaseManager: Marked ${ids.length} records as uploaded');
+    } catch (e) {
+      developer.log('❌ DatabaseManager: Error marking records as uploaded: $e');
+      rethrow;
+    }
   }
 
-  Future<void> clearAllAirQualityData() async {
+// Új metódus: adatbázis állapot ellenőrzése
+  Future<Map<String, dynamic>> getDatabaseStatus() async {
     final dbClient = await db;
+    try {
+      final totalCount = Sqflite.firstIntValue(
+          await dbClient.rawQuery('SELECT COUNT(*) FROM air_quality')
+      ) ?? 0;
+
+      final unsyncedCount = Sqflite.firstIntValue(
+          await dbClient.rawQuery('SELECT COUNT(*) FROM air_quality WHERE uploaded = 0')
+      ) ?? 0;
+
+      return {
+        'total': totalCount,
+        'unsynced': unsyncedCount,
+        'synced': totalCount - unsyncedCount
+      };
+    } catch (e) {
+      developer.log('❌ DatabaseManager: Error getting database status: $e');
+      return {'total': 0, 'unsynced': 0, 'synced': 0};
+    }
+  }
+
+  // In database_manager.dart
+  Future<void> clearAllAirQualityData() async {
+    final dbClient = await db; // JAVÍTÁS: használd a 'db' gettert
     await dbClient.delete('air_quality');
   }
-
   Future<void> close() async {
     final dbClient = await db;
     await dbClient.close();
